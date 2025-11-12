@@ -21,9 +21,15 @@ grad_clip = 1.0
 
 # Batching config
 micro_batch_size = 4
-gradient_accumulation_steps = 4 # NEW: Set how many micro-batches to accumulate
+gradient_accumulation_steps = 4
 effective_batch_size = micro_batch_size * gradient_accumulation_steps
 print(f"Effective batch size: {effective_batch_size}")
+
+# Curriculum Learning Config
+initial_seq_len = 16
+final_seq_len = 32
+seq_len_warmup_steps = 50 
+print(f"Using progressive sequence length: {initial_seq_len} for {seq_len_warmup_steps} steps, then {final_seq_len}.")
 
 
 # System config
@@ -47,18 +53,18 @@ vocab_size = max(tokenizer.vocab.keys()) + 1
 
 # Dataset and DataLoader
 corpus_path = "data_corpus/sample.txt"
-seq_len = 32
-dataset = StreamingTextDataset(tokenizer, corpus_path, seq_len)
-# The DataLoader now uses the micro_batch_size
+current_seq_len = initial_seq_len
+dataset = StreamingTextDataset(tokenizer, corpus_path, current_seq_len)
 dataloader = DataLoader(dataset, batch_size=micro_batch_size)
 
 # Model
+# Initialise the model with the FINAL sequence length so RoPE cache is large enough
 model_config = NanoGptConfig(
     vocab_size=vocab_size,
     embed_dim=128,
     num_layers=4,
     num_heads=4,
-    seq_len=seq_len,
+    seq_len=final_seq_len, 
     attention_type='mha'
 )
 model = NanoGptModel(model_config)
@@ -77,8 +83,19 @@ running_loss = 0.0
 data_iter = iter(dataloader)
 start_time = time.time()
 
-print("\n Starting Training (with Gradient Accumulation) ")
+print("\n Starting Training (with Progressive Sequence Length) ")
 while step < max_steps:
+    
+    # Sequence Length Transition Logic
+    if step == seq_len_warmup_steps:
+        print("\n" + "="*50)
+        print(f"Warmup complete. Switching to sequence length: {final_seq_len}")
+        print("="*50 + "\n")
+        current_seq_len = final_seq_len
+        # Recreate dataset and dataloader with the new sequence length
+        dataset = StreamingTextDataset(tokenizer, corpus_path, current_seq_len)
+        dataloader = DataLoader(dataset, batch_size=micro_batch_size)
+        data_iter = iter(dataloader) # Reset the iterator
     
     optimizer.zero_grad(set_to_none=True)
     
@@ -93,10 +110,8 @@ while step < max_steps:
 
         with ctx:
             logits, loss = model(x, y)
-            #  Divide the loss by the number of accumulation steps to keep the gradient magnitude consistent.
             loss = loss / gradient_accumulation_steps
         
-        # Accumulate scaled gradients
         scaler.scale(loss).backward()
         
     scaler.unscale_(optimizer)
@@ -104,16 +119,16 @@ while step < max_steps:
     scaler.step(optimizer)
     scaler.update()
     
-    # LR scheduler step is also tied to the optimizer step
     scheduler.step()
     
-    # Logging
     running_loss += loss.item() * gradient_accumulation_steps
     if (step + 1) % 10 == 0:
         end_time = time.time()
         avg_loss = running_loss / 10
         steps_per_sec = 10 / (end_time - start_time)
-        print(f"Step {step+1:4d}/{max_steps} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f} | Steps/sec: {steps_per_sec:.2f}")
+        
+        # Log the current sequence length being used
+        print(f"Step {step+1:4d}/{max_steps} | SeqLen: {current_seq_len:2d} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f} | Steps/sec: {steps_per_sec:.2f}")
         running_loss = 0.0
         start_time = time.time()
 
