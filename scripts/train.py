@@ -1,0 +1,113 @@
+import torch
+from torch.utils.data import DataLoader
+import os
+import sys
+import time
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from nano_gpt.config.model_config import NanoGptConfig
+from nano_gpt.model.model import NanoGptModel
+from nano_gpt.tokenizer.bpe import BpeTokenizer
+from nano_gpt.data.dataset import StreamingTextDataset
+
+# Config
+max_steps = 200
+learning_rate = 1e-4
+weight_decay = 0.1
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 1.0
+batch_size = 4
+
+# System config
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
+# Setup
+# Tokenizer
+tokenizer_prefix = "bpe_tokenizer"
+assert os.path.exists(f"{tokenizer_prefix}.vocab.json"), "Tokenizer model not found. Run the tokenizer training script first."
+tokenizer = BpeTokenizer()
+tokenizer.load(tokenizer_prefix)
+
+# Calculate correct vocab size
+# After loading, tokenizer.vocab is {token_id -> token_bytes}
+# So the keys contain the token IDs
+vocab_size = max(tokenizer.vocab.keys()) + 1
+
+print(f"Tokenizer vocab entries: {len(tokenizer.vocab)}")
+print(f"Token ID range: [0, {max(tokenizer.vocab.keys())}]")
+print(f"Actual vocab_size used: {vocab_size}")
+
+# Dataset and DataLoader
+corpus_path = "data_corpus/sample.txt"
+seq_len = 32
+dataset = StreamingTextDataset(tokenizer, corpus_path, seq_len)
+dataloader = DataLoader(dataset, batch_size=batch_size)
+
+# Model
+model_config = NanoGptConfig(
+    vocab_size=vocab_size,  
+    embed_dim=128,
+    num_layers=4,
+    num_heads=4,
+    seq_len=seq_len,
+    attention_type='mha'
+)
+model = NanoGptModel(model_config)
+model.to(device)
+print(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters.")
+
+#  Optimizer
+optimizer = model.configure_optimizer(weight_decay, learning_rate, (beta1, beta2))
+
+# Learning Rate Scheduler (Cosine Annealing with Warmup)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=learning_rate/10)
+
+# Training Loop
+step = 0
+running_loss = 0.0
+data_iter = iter(dataloader)
+start_time = time.time()
+
+print("\n Starting Training ")
+while step < max_steps:
+    
+    try:
+        x, y = next(data_iter)
+    except StopIteration:
+        data_iter = iter(dataloader)
+        x, y = next(data_iter)
+
+    x, y = x.to(device), y.to(device)
+
+    # Forward pass
+    logits, loss = model(x, y)
+    
+    # Backward pass
+    loss.backward()
+
+    # Gradient Clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    
+    # Update weights
+    optimizer.step()
+
+    # Update learning rate
+    scheduler.step()
+
+    # Zero gradients for the next iteration
+    optimizer.zero_grad(set_to_none=True)
+
+    # Logging
+    running_loss += loss.item()
+    if (step + 1) % 10 == 0:
+        end_time = time.time()
+        avg_loss = running_loss / 10
+        steps_per_sec = 10 / (end_time - start_time)
+        print(f"Step {step+1:4d}/{max_steps} | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f} | Steps/sec: {steps_per_sec:.2f}")
+        running_loss = 0.0
+        start_time = time.time()
+
+    step += 1
+
+print("\n--- Training Complete ---")

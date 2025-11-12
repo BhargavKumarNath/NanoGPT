@@ -35,7 +35,7 @@ class NanoGptModel(nn.Module):
                 attn = MultiHeadAttention(config.embed_dim, config.num_heads, config.dropout, config.bias, rope=rope)
             elif config.attention_type == 'gqa':
                 attn = GroupedQueryAttention(config.embed_dim, config.num_heads, config.num_kv_heads, config.dropout, config.bias)
-                # RoPE would need to be integrated into GQA as well for a full implementation
+                # RoPE need to be integrated into GQA as well for a full implementation
             elif config.attention_type == 'swa':
                 attn = SlidingWindowAttention(config.embed_dim, config.num_heads, config.num_kv_heads, config.window_size, config.dropout, config.bias)
             else:
@@ -95,3 +95,29 @@ class NanoGptModel(nn.Module):
 
 
         return logits, loss
+    
+    def configure_optimizer(self, weight_decay, learning_rate, betas):
+        """
+        Configuration the AdamW optimizer with proper weight decay settings. Weight decay is not applied to bias terms or normalization layer gains
+        """
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+
+        # Seperate parameters into 2 groups: With and without weight decay
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"Num. decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"Num. non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+        return optimizer
+
+
+
