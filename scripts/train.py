@@ -3,31 +3,39 @@ from torch.utils.data import DataLoader
 import os
 import sys
 import time
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from nano_gpt.config.model_config import NanoGptConfig
 from nano_gpt.model.model import NanoGptModel
 from nano_gpt.tokenizer.bpe import BpeTokenizer
 from nano_gpt.data.dataset import StreamingTextDataset
 
-# Config
+# Training config
 max_steps = 200
 learning_rate = 1e-4
 weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
-batch_size = 4
+
+# Batching config
+micro_batch_size = 4
+gradient_accumulation_steps = 4 # NEW: Set how many micro-batches to accumulate
+effective_batch_size = micro_batch_size * gradient_accumulation_steps
+print(f"Effective batch size: {effective_batch_size}")
+
 
 # System config
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True 
 print(f"Using device: {device}")
 
-# Mixed Precision
+# Mixed Precision Setup
 pt_dtype = torch.float16 if device == 'cuda' else torch.float32
 ctx = torch.amp.autocast(device_type=device, dtype=pt_dtype)
 scaler = torch.amp.GradScaler(device, enabled=(pt_dtype == torch.float16))
-print(f"Using Mixed Precision with Dtype: {pt_dtype}")
+print(f"Using mixed precision with dtype: {pt_dtype}")
 
 # Setup
 # Tokenizer
@@ -41,7 +49,8 @@ vocab_size = max(tokenizer.vocab.keys()) + 1
 corpus_path = "data_corpus/sample.txt"
 seq_len = 32
 dataset = StreamingTextDataset(tokenizer, corpus_path, seq_len)
-dataloader = DataLoader(dataset, batch_size=batch_size)
+# The DataLoader now uses the micro_batch_size
+dataloader = DataLoader(dataset, batch_size=micro_batch_size)
 
 # Model
 model_config = NanoGptConfig(
@@ -68,44 +77,38 @@ running_loss = 0.0
 data_iter = iter(dataloader)
 start_time = time.time()
 
-print("\nStarting Training (with Mixed Precision)")
+print("\n Starting Training (with Gradient Accumulation) ")
 while step < max_steps:
     
-    try:
-        x, y = next(data_iter)
-    except StopIteration:
-        data_iter = iter(dataloader)
-        x, y = next(data_iter)
-
-    x, y = x.to(device), y.to(device)
-
-    # Forward pass with autocast
-    with ctx:
-        logits, loss = model(x, y)
+    optimizer.zero_grad(set_to_none=True)
     
-    # Backward pass with GradScaler
-    # Scale the loss
-    scaler.scale(loss).backward()
+    for micro_step in range(gradient_accumulation_steps):
+        try:
+            x, y = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            x, y = next(data_iter)
 
-    # Gradient Clipping
-    # Unscale the gradients before clipping to see their true values
+        x, y = x.to(device), y.to(device)
+
+        with ctx:
+            logits, loss = model(x, y)
+            #  Divide the loss by the number of accumulation steps to keep the gradient magnitude consistent.
+            loss = loss / gradient_accumulation_steps
+        
+        # Accumulate scaled gradients
+        scaler.scale(loss).backward()
+        
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    # Update weights 
     scaler.step(optimizer)
-
-    # Update the scale for the next iteration
     scaler.update()
     
-    # Update learning rate
+    # LR scheduler step is also tied to the optimizer step
     scheduler.step()
-
-    # Zero gradients for the next iteration
-    optimizer.zero_grad(set_to_none=True)
-
+    
     # Logging
-    running_loss += loss.item()
+    running_loss += loss.item() * gradient_accumulation_steps
     if (step + 1) % 10 == 0:
         end_time = time.time()
         avg_loss = running_loss / 10
