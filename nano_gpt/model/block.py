@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 from typing import Type
+from .regularization import DropPath 
 
 class TransformerBlock(nn.Module):
     """
     A single block of transformer model, using pre-normalisation
     """
-    def __init__(self, embed_dim: int, attn: nn.Module, ffn: nn.Module, norm_cls: Type[nn.Module]):
+    def __init__(self, embed_dim: int, attn: nn.Module, ffn: nn.Module, norm_cls: Type[nn.Module], drop_path_rate: float = 0.0):
         """
         Args:
             embed_dim (int): The embedding dimension.
@@ -19,6 +20,10 @@ class TransformerBlock(nn.Module):
         self.ffn = ffn
         self.norm1 = norm_cls(embed_dim)
         self.norm2 = norm_cls(embed_dim)
+
+        # DropPath layers
+        self.drop_path1 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.drop_path2 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -34,10 +39,10 @@ class TransformerBlock(nn.Module):
         """
         # First Sub layer: Atrention
         attn_output = self.attn(self.norm1(x))
-        x = x + attn_output
+        x = x + self.drop_path1(attn_output)
 
         # Second Sub layer: Feed forward Network
         ffn_output = self.ffn(self.norm2(x))
-        x = x + ffn_output
+        x = x + self.drop_path2(ffn_output)
 
         return x

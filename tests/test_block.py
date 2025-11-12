@@ -63,5 +63,51 @@ def test_transformer_block_assembly():
 
     print(f"Status: OK")
 
+def test_transformer_block_with_droppath():
+    """Tests that DropPath works correctly in both train and eval modes."""
+    print("\n--- Testing Transformer Block with DropPath ---")
+
+    # Config
+    batch_size, seq_len, embed_dim, num_heads = 2, 8, 16, 4
+    head_dim = embed_dim // num_heads
+    drop_path_rate = 0.5 
+
+    # Setup
+    input_tensor = torch.ones(batch_size, seq_len, embed_dim)
+    
+    attention_module = MultiHeadAttention(embed_dim, num_heads)
+    ffn_module = SwiGLUFeedForward(embed_dim)
+
+    # Instantiate the Block with DropPath
+    block = TransformerBlock(embed_dim, attention_module, ffn_module, RMSNorm, drop_path_rate)
+
+    # Test in EVAL mode
+    block.eval()
+    with torch.no_grad():
+        output_eval_1 = block(input_tensor.clone())
+        output_eval_2 = block(input_tensor.clone())
+    
+    print("In eval mode: Two forward passes produce identical results.")
+    assert torch.allclose(output_eval_1, output_eval_2), "Outputs should be deterministic in eval mode"
+
+    # Test in TRAIN mode
+    block.train()
+    output_train_1 = block(input_tensor.clone())
+    output_train_2 = block(input_tensor.clone())
+
+    print("In train mode: Two forward passes produce different results (stochastic).")
+    assert not torch.allclose(output_train_1, output_train_2), "Outputs should be stochastic in train mode"
+
+    # Check if the output is different from a block with no DropPath
+    block_no_drop = TransformerBlock(embed_dim, attention_module, ffn_module, RMSNorm, 0.0)
+    block_no_drop.eval() 
+    output_no_drop = block_no_drop(input_tensor.clone())
+
+    print("In train mode: Output is different from a block with no DropPath.")
+    assert not torch.allclose(output_train_1, output_no_drop), "DropPath should alter the output in train mode"
+
+    print("Status: OK")
+
 if __name__ == "__main__":
     test_transformer_block_assembly()
+    test_transformer_block_with_droppath()
