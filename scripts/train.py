@@ -20,23 +20,22 @@ batch_size = 4
 
 # System config
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+torch.backends.cudnn.benchmark = True
 print(f"Using device: {device}")
+
+# Mixed Precision
+pt_dtype = torch.float16 if device == 'cuda' else torch.float32
+ctx = torch.amp.autocast(device_type=device, dtype=pt_dtype)
+scaler = torch.amp.GradScaler(device, enabled=(pt_dtype == torch.float16))
+print(f"Using Mixed Precision with Dtype: {pt_dtype}")
 
 # Setup
 # Tokenizer
 tokenizer_prefix = "bpe_tokenizer"
-assert os.path.exists(f"{tokenizer_prefix}.vocab.json"), "Tokenizer model not found. Run the tokenizer training script first."
+assert os.path.exists(f"{tokenizer_prefix}.vocab.json"), "Tokenizer model not found."
 tokenizer = BpeTokenizer()
 tokenizer.load(tokenizer_prefix)
-
-# Calculate correct vocab size
-# After loading, tokenizer.vocab is {token_id -> token_bytes}
-# So the keys contain the token IDs
 vocab_size = max(tokenizer.vocab.keys()) + 1
-
-print(f"Tokenizer vocab entries: {len(tokenizer.vocab)}")
-print(f"Token ID range: [0, {max(tokenizer.vocab.keys())}]")
-print(f"Actual vocab_size used: {vocab_size}")
 
 # Dataset and DataLoader
 corpus_path = "data_corpus/sample.txt"
@@ -46,7 +45,7 @@ dataloader = DataLoader(dataset, batch_size=batch_size)
 
 # Model
 model_config = NanoGptConfig(
-    vocab_size=vocab_size,  
+    vocab_size=vocab_size,
     embed_dim=128,
     num_layers=4,
     num_heads=4,
@@ -57,10 +56,10 @@ model = NanoGptModel(model_config)
 model.to(device)
 print(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters.")
 
-#  Optimizer
+# Optimizer
 optimizer = model.configure_optimizer(weight_decay, learning_rate, (beta1, beta2))
 
-# Learning Rate Scheduler (Cosine Annealing with Warmup)
+# Learning Rate Scheduler
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=learning_rate/10)
 
 # Training Loop
@@ -69,7 +68,7 @@ running_loss = 0.0
 data_iter = iter(dataloader)
 start_time = time.time()
 
-print("\n Starting Training ")
+print("\nStarting Training (with Mixed Precision)")
 while step < max_steps:
     
     try:
@@ -80,18 +79,25 @@ while step < max_steps:
 
     x, y = x.to(device), y.to(device)
 
-    # Forward pass
-    logits, loss = model(x, y)
+    # Forward pass with autocast
+    with ctx:
+        logits, loss = model(x, y)
     
-    # Backward pass
-    loss.backward()
+    # Backward pass with GradScaler
+    # Scale the loss
+    scaler.scale(loss).backward()
 
     # Gradient Clipping
+    # Unscale the gradients before clipping to see their true values
+    scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     
-    # Update weights
-    optimizer.step()
+    # Update weights 
+    scaler.step(optimizer)
 
+    # Update the scale for the next iteration
+    scaler.update()
+    
     # Update learning rate
     scheduler.step()
 
