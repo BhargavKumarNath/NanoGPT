@@ -82,7 +82,7 @@ class GroupedQueryAttention(nn.Module):
     """A from scratch implementation of Grouped-Query Attention (GQA).
     Multi-Query Attention (MQA) is a special case of GQA where num_kv_heads=1
     """
-    def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int, dropout: float = 0.1, bias: bool = True):
+    def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int, dropout: float = 0.1, bias: bool = True, rope: RotaryPositionalEmbeddings = None):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         assert num_heads % num_kv_heads == 0, "num_heads must be multiple of num_kv_heads"
@@ -101,6 +101,9 @@ class GroupedQueryAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
+        
+        # Add RoPE
+        self.rope = rope
 
     @staticmethod
     def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -118,16 +121,19 @@ class GroupedQueryAttention(nn.Module):
              .reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
         )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, past_kv: tuple[torch.Tensor, torch.Tensor] = None, use_cache: bool = False):
         """
         Forward pass for Grouped-Query Attention.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim)
-            mask (torch.Tensor, optional): Causal mask of shape (seq_len, seq_len).
+            mask (torch.Tensor, optional): Causal mask.
+            past_kv (tuple, optional): A tuple containing the cached key and value tensors.
+            use_cache (bool): If True, return the updated key and value tensors.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim)
+            (optional) tuple: New KV cache
         """
         batch_size, seq_len, _ = x.shape
 
@@ -143,27 +149,47 @@ class GroupedQueryAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        # 3. Repeat K and V heads to match Q heads
-        k = self.repeat_kv(k, self.kv_repeat_factor)
-        v = self.repeat_kv(v, self.kv_repeat_factor)
+        # 3. Apply RoPE
+        if self.rope:
+            q, k = self.rope(q, k)
+        
+        # 4. KV Cache Logic
+        if past_kv is not None:
+            # Concatenate the new k, v with the cached ones
+            past_key, past_value = past_kv
+            k = torch.cat((past_key, k), dim=-2)
+            v = torch.cat((past_value, v), dim=-2)
+        
+        # If use_cache is True, we store the new k,v for the next iteration
+        present_kv = (k, v) if use_cache else None
+        # End KV Cache Logic
 
-        # 4. Compute attention scores (same as MHA from here)
-        attn_scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        # 5. Repeat K and V heads to match Q heads
+        # This must be done *after* caching the non-repeated k/v
+        k_rep = self.repeat_kv(k, self.kv_repeat_factor)
+        v_rep = self.repeat_kv(v, self.kv_repeat_factor)
+
+        # 6. Compute attention scores (same as MHA from here)
+        attn_scores = (q @ k_rep.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
         if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+            # The mask needs to be sliced correctly for single-token generation
+            attn_scores = attn_scores.masked_fill(mask[:, :, -seq_len:, :], float('-inf'))
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
-        context = attn_weights @ v
+        context = attn_weights @ v_rep
 
-        # 5. Concatenate heads and project back
+        # 7. Concatenate heads and project back
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
         output = self.out_proj(context)
         output = self.resid_dropout(output)
 
-        return output
+        if use_cache:
+            return output, present_kv
+        else:
+            return output
 
 class SlidingWindowAttention(nn.Module):
     """A from scratch implementation of Sliding Window Attention with GQA

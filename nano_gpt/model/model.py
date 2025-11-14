@@ -20,20 +20,14 @@ class NanoGptModel(nn.Module):
         assert config.vocab_size is not None, "vocab_size must be set"
         assert config.seq_len is not None, "seq_len must be set"
 
-        # -----------------------------
         # 1. Token Embeddings
-        # -----------------------------
         self.token_embeddings = nn.Embedding(config.vocab_size, config.embed_dim)
 
-        # -----------------------------
         # 2. Positional Encoding (RoPE)
-        # -----------------------------
         head_dim = config.embed_dim // config.num_heads
         rope = RotaryPositionalEmbeddings(head_dim, max_seq_len=config.seq_len)
 
-        # -----------------------------
         # 3. Transformer Blocks
-        # -----------------------------
         self.blocks = nn.ModuleList()
 
         # Linearly increasing DropPath rates (0 → config.dropout)
@@ -87,23 +81,17 @@ class NanoGptModel(nn.Module):
             )
             self.blocks.append(block)
 
-        # -----------------------------
         # 4. Final Layers
-        # -----------------------------
         self.final_norm = RMSNorm(config.embed_dim)
         self.lm_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
 
         # Weight tying (sharing)
         self.token_embeddings.weight = self.lm_head.weight
 
-        # -----------------------------
         # 5. Initialize Weights
-        # -----------------------------
         self.apply(self._init_weights)
 
-    # -----------------------------
     # Weight Initialization
-    # -----------------------------
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -112,9 +100,7 @@ class NanoGptModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # -----------------------------
     # Forward Pass
-    # -----------------------------
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, past_kv_cache: list = None, use_cache: bool = False):
         batch_size, seq_len = idx.shape
         
@@ -149,42 +135,55 @@ class NanoGptModel(nn.Module):
             return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None):
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None, top_p: float = None):
         """
-        Autoregressively generate a sequence of tokens.
+        Autoregressively generate a sequence of tokens using Top-k and/or Top-p (Nucleus) sampling.
         """
-        self.eval() 
-        
+        self.eval()
         kv_cache = None
         
         for _ in range(max_new_tokens):
-            # If the sequence is getting too long, crop it to the supported length
             idx_cond = idx if idx.size(1) <= self.config.seq_len else idx[:, -self.config.seq_len:]
             
-            # Forward pass to get logits for the next token
             logits, _, kv_cache = self(idx_cond, use_cache=True, past_kv_cache=kv_cache)
             
             logits = logits[:, -1, :] / temperature
             
+            # Optional Top-K sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-                
+
             # Apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)
             
-            # Sample the next token
-            idx_next = torch.multinomial(probs, num_samples=1)
+            # Top-p (Nucleus) sampling
+            if top_p is not None:
+                # Sort probabilities in descending order
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                # Calculate cumulative probabilities
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep the first one that exceeds the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # Create a mask of tokens to remove
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                # Apply the mask by setting the probability of removed tokens to 0
+                probs[indices_to_remove] = 0
+                # Renormalize the probabilities
+                probs = probs / probs.sum(dim=-1, keepdim=True)
             
-            # Append the new token to the sequence
+            # Sample from the (potentially modified) distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
             
-        self.train() # Set model back to training mode
+        self.train()
         return idx
 
-    # -----------------------------
     # Optimizer Configuration
-    # -----------------------------
     def configure_optimizer(self, weight_decay, learning_rate, betas):
         """
         Configures the AdamW optimizer with proper weight decay settings.
