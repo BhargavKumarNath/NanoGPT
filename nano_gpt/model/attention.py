@@ -23,65 +23,60 @@ class MultiHeadAttention(nn.Module):
 
         self.rope = rope
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, past_kv: tuple[torch.Tensor, torch.Tensor] = None, use_cache: bool = False):
         """
         Forward pass for Multi-Head Attention.
-
+        
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim)
-            mask (torch.Tensor, optional): Attention mask. For causal masking, this should
-                                           be a tensor of shape (seq_len, seq_len)
-                                           where the upper triangle is `True`.
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, embed_dim)
+            x (torch.Tensor): Input tensor. Shape (batch, seq_len, embed_dim)
+            mask (torch.Tensor, optional): Causal mask.
+            past_kv (tuple, optional): A tuple containing the cached key and value tensors.
+            use_cache (bool): If True, return the updated key and value tensors.
         """
         batch_size, seq_len, _ = x.shape
-
-        # 1. Project to Q, K, V and split
-        # qkv: (batch_size, seq_len, 3 * embed_dim)
+        
         qkv = self.wqkv(x)
-        # q, k, v: each (batch_size, seq_len, embed_dim)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        # 2. Reshape for multi-head computation
-        # (batch_size, seq_len, embed_dim) -> (batch_size, seq_len, num_heads, head_dim)
-        # -> (batch_size, num_heads, seq_len, head_dim)
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Apply Rotary
         if self.rope:
+            # During generation with KV cache, seq_len is 1. We need to apply RoPE
+            # based on the token's actual position in the sequence.
             q, k = self.rope(q, k)
-
-        # 3. Compute attention scores (scaled dot-product)
-        # (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len)
-        # -> (batch, num_heads, seq_len, seq_len)
+        
+        # KV Cache Logic
+        if past_kv is not None:
+            # Concatenate the new k, v with the cached ones
+            past_key, past_value = past_kv
+            k = torch.cat((past_key, k), dim=-2)
+            v = torch.cat((past_value, v), dim=-2)
+        
+        # If use_cache is True, we store the new k,v for the next iteration
+        present_kv = (k, v) if use_cache else None
+        # End KV Cache Logic
+        
         attn_scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
-        # 4. Apply mask
         if mask is not None:
-            # mask shape: (seq_len, seq_len)
-            # attn_scores shape: (batch_size, num_heads, seq_len, seq_len)
-            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
-
-        # 5. Apply softmax to get attention weights
+            # The mask needs to be sliced correctly for single-token generation
+            attn_scores = attn_scores.masked_fill(mask[:, :, -seq_len:, :], float('-inf'))
+        
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
-        # 6. Apply weights to values
-        # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim)
-        # -> (batch, num_heads, seq_len, head_dim)
         context = attn_weights @ v
 
-        # 7. Concatenate heads and project back
-        # Transpose and reshape to (batch_size, seq_len, embed_dim)
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
         output = self.out_proj(context)
         output = self.resid_dropout(output)
 
-        return output
+        if use_cache:
+            return output, present_kv
+        else:
+            return output
     
 class GroupedQueryAttention(nn.Module):
     """A from scratch implementation of Grouped-Query Attention (GQA).
@@ -187,7 +182,7 @@ class SlidingWindowAttention(nn.Module):
         if self.mask is not None and self.mask.shape[-1] >= seq_len:
             return self.mask[:, :, :seq_len, :seq_len].to(device)
 
-        # Initialize everything as masked
+        # Initialise everything as masked
         mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
 
         # For each token position i, unmask the valid window range
@@ -218,7 +213,7 @@ class SlidingWindowAttention(nn.Module):
         sliding_window_mask = self._create_sliding_window_mask(seq_len, x.device)
 
         # 2. Use the GQA forward pass with our generated mask
-        # --- Replicating GQA's forward pass logic here ---
+        # Replicating GQA's forward pass logic here
         q = self.gqa.wq(x)
         k = self.gqa.wk(x)
         v = self.gqa.wv(x)

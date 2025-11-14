@@ -40,7 +40,7 @@ class NanoGptModel(nn.Module):
         drop_path_rates = [x.item() for x in torch.linspace(0, config.dropout, config.num_layers)]
 
         for i, drop_rate in enumerate(drop_path_rates):
-            # --- Select Attention Type ---
+            # Select Attention Type
             if config.attention_type == 'mha':
                 attn = MultiHeadAttention(
                     config.embed_dim,
@@ -57,7 +57,6 @@ class NanoGptModel(nn.Module):
                     config.dropout,
                     config.bias
                 )
-                # NOTE: Add RoPE to GQA later if needed
             elif config.attention_type == 'swa':
                 attn = SlidingWindowAttention(
                     config.embed_dim,
@@ -70,7 +69,7 @@ class NanoGptModel(nn.Module):
             else:
                 raise ValueError(f"Unknown attention type: {config.attention_type}")
 
-            # --- Feed Forward Network ---
+            # Feed Forward Network
             ffn = SwiGLUFeedForward(
                 config.embed_dim,
                 config.ffn_hidden_dim,
@@ -78,13 +77,13 @@ class NanoGptModel(nn.Module):
                 config.bias
             )
 
-            # --- Transformer Block ---
+            # Transformer Block
             block = TransformerBlock(
                 embed_dim=config.embed_dim,
                 attn=attn,
                 ffn=ffn,
                 norm_cls=RMSNorm,
-                drop_path_rate=drop_rate,  # NEW: per-block stochastic depth
+                drop_path_rate=drop_rate,  
             )
             self.blocks.append(block)
 
@@ -116,32 +115,72 @@ class NanoGptModel(nn.Module):
     # -----------------------------
     # Forward Pass
     # -----------------------------
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, past_kv_cache: list = None, use_cache: bool = False):
         batch_size, seq_len = idx.shape
-
-        # 1. Token embeddings
+        
         x = self.token_embeddings(idx)
+        
+        present_kv_cache = [] if use_cache else None
 
-        # 2. Transformer blocks
-        for block in self.blocks:
-            x = block(x)
-
-        # 3. Final normalization
+        for i, block in enumerate(self.blocks):
+            past_kv = past_kv_cache[i] if past_kv_cache is not None else None
+            
+            h = block.norm1(x)
+            attn_output = block.attn(h, past_kv=past_kv, use_cache=use_cache)
+            if use_cache:
+                attn_output, present_kv = attn_output
+                present_kv_cache.append(present_kv)
+            x = x + block.drop_path1(attn_output)
+            
+            h = block.norm2(x)
+            ffn_output = block.ffn(h)
+            x = x + block.drop_path2(ffn_output)
+            
         x = self.final_norm(x)
-
-        # 4. LM Head
         logits = self.lm_head(x)
-
-        # 5. Compute loss (optional)
+        
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1
-            )
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        
+        if use_cache:
+            return logits, loss, present_kv_cache
+        else:
+            return logits, loss
 
-        return logits, loss
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None):
+        """
+        Autoregressively generate a sequence of tokens.
+        """
+        self.eval() 
+        
+        kv_cache = None
+        
+        for _ in range(max_new_tokens):
+            # If the sequence is getting too long, crop it to the supported length
+            idx_cond = idx if idx.size(1) <= self.config.seq_len else idx[:, -self.config.seq_len:]
+            
+            # Forward pass to get logits for the next token
+            logits, _, kv_cache = self(idx_cond, use_cache=True, past_kv_cache=kv_cache)
+            
+            logits = logits[:, -1, :] / temperature
+            
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+                
+            # Apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1)
+            
+            # Sample the next token
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append the new token to the sequence
+            idx = torch.cat((idx, idx_next), dim=1)
+            
+        self.train() # Set model back to training mode
+        return idx
 
     # -----------------------------
     # Optimizer Configuration
