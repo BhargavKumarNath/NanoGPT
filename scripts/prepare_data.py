@@ -16,7 +16,7 @@ def download_and_prepare():
     dataset = load_dataset("roneneldan/TinyStories", split="train")
 
     print("Preparing data file...")
-    num_stories = 5000
+    num_stories = 50000
 
     with open(output_filename, "w", encoding="utf-8") as f:
         for i in range(num_stories):

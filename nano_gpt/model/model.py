@@ -93,7 +93,7 @@ class NanoGptModel(nn.Module):
         # 5. Initialize Weights
         self.apply(self._init_weights)
 
-    # Weight Initialization
+    # Weight Initialisation
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -108,21 +108,40 @@ class NanoGptModel(nn.Module):
         x = self.token_embeddings(idx)
         present_kv_cache = [] if use_cache else None
 
+        # CREATE CAUSAL MASK
+        if use_cache and past_kv_cache is not None and len(past_kv_cache) > 0:
+            # During generation with KV cache
+            past_len = past_kv_cache[0][0].size(-2)
+            full_len = past_len + seq_len
+            # Mask shape: (seq_len, full_len)
+            mask = torch.triu(torch.ones(seq_len, full_len, device=idx.device, dtype=torch.bool), diagonal=past_len + 1)
+        else:
+            # Normal forward pass: standard causal mask
+            # Mask shape: (seq_len, seq_len)
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=idx.device, dtype=torch.bool), diagonal=1)
+        
+        # Add batch and head dimensions for broadcasting
+        mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len or full_len)
+
+        # Pass through transformer blocks WITH MASK
         for i, block in enumerate(self.blocks):
             past_kv = past_kv_cache[i] if past_kv_cache is not None else None
             
-            h = block.norm1(x)
-            attn_output = block.attn(h, past_kv=past_kv, use_cache=use_cache, start_pos=start_pos)
+            # Call block with all parameters
+            block_result = block(
+                x, 
+                mask=mask, 
+                past_kv=past_kv, 
+                use_cache=use_cache, 
+                start_pos=start_pos
+            )
             
+            # Handle cache returns
             if use_cache:
-                attn_output, present_kv = attn_output
+                x, present_kv = block_result
                 present_kv_cache.append(present_kv)
-            
-            x = x + block.drop_path1(attn_output)
-            
-            h = block.norm2(x)
-            ffn_output = block.ffn(h)
-            x = x + block.drop_path2(ffn_output)
+            else:
+                x = block_result
         
         x = self.final_norm(x)
         logits = self.lm_head(x)
@@ -141,30 +160,36 @@ class NanoGptModel(nn.Module):
             return logits, loss
 
 
+
     @torch.no_grad()
     def generate(
-    self,
-    idx: torch.Tensor,
-    max_new_tokens: int,
-    temperature: float = 1.0,
-    top_k: int = None,
-    top_p: float = None
-):
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = None,
+        top_p: float = None
+    ):
         """
         Autoregressively generate a sequence of tokens using Top-k and/or Top-p sampling.
-        Tracks start_pos for RoPE.
+        Tracks start_pos for RoPE correctly.
         """
         self.eval()
         kv_cache = None
 
         for i in range(max_new_tokens):
-            # Current position in the sequence
-            start_pos = idx.size(1) - 1 if i > 0 else 0
+            # Determine which tokens to process
+            if i == 0:
+                # First iteration: process the entire prompt
+                idx_cond = idx
+                start_pos = 0
+            else:
+                # Subsequent iterations: only process the last token
+                idx_cond = idx[:, -1:]
+                # start_pos is where this new token sits in the full sequence
+                start_pos = idx.size(1) - 1
 
-            # For the first token, use full prompt; else only newest token
-            idx_cond = idx if i == 0 else idx[:, -1:]
-
-            # Forward pass with start_pos
+            # Forward pass with KV cache and correct start_pos
             logits, _, kv_cache = self(
                 idx_cond,
                 use_cache=True,
@@ -172,35 +197,43 @@ class NanoGptModel(nn.Module):
                 start_pos=start_pos
             )
 
+            # Get logits for the last position and apply temperature
             logits = logits[:, -1, :] / temperature
 
-            # Optional Top-K sampling
-            if top_k is not None:
+            # Apply Top-K filtering if specified
+            if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
 
-            # Softmax probabilities
+            # Convert to probabilities
             probs = F.softmax(logits, dim=-1)
 
-            # Top-p (Nucleus) sampling
-            if top_p is not None:
+            # Apply Top-P (nucleus) filtering if specified
+            if top_p is not None and top_p < 1.0:
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
+                # Remove tokens with cumulative probability above the threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep at least one token
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
+                sorted_indices_to_remove[..., 0] = False
 
+                # Scatter back to original indexing
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                probs[indices_to_remove] = 0
+                probs[indices_to_remove] = 0.0
+                
+                # Renormalize
+                probs = probs / probs.sum(dim=-1, keepdim=True)
 
-            # Sample next token
+            # Sample the next token
             idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append to the sequence
             idx = torch.cat((idx, idx_next), dim=1)
 
         self.train()
         return idx
-
 
     # Optimizer Configuration
     def configure_optimizer(self, weight_decay, learning_rate, betas):

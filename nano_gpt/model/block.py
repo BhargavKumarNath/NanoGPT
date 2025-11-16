@@ -25,24 +25,45 @@ class TransformerBlock(nn.Module):
         self.drop_path1 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.drop_path2 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, past_kv=None, use_cache: bool = False, start_pos: int = 0):
         """
-        Forward pass for the Teansformer Block.
+        Forward pass for the Transformer Block with mask support.
         
         Architecture: Pre-Norm (Norm -> Attention -> Residual -> Norm -> FFN -> Residual)
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim)
+            mask (torch.Tensor, optional): Causal attention mask
+            past_kv (tuple, optional): Cached key and value tensors
+            use_cache (bool): Whether to return KV cache
+            start_pos (int): Starting position for RoPE
         
         Returns:
-            torch.Tensor: Output tensor of the same shape.
+            torch.Tensor or tuple: Output tensor, optionally with present_kv if use_cache=True
         """
-        # First Sub layer: Atrention
-        attn_output = self.attn(self.norm1(x))
+        # First Sub layer: Attention with mask
+        attn_result = self.attn(
+            self.norm1(x),
+            mask=mask,
+            past_kv=past_kv,
+            use_cache=use_cache,
+            start_pos=start_pos
+        )
+        
+        # Handle KV cache return
+        if use_cache:
+            attn_output, present_kv = attn_result
+        else:
+            attn_output = attn_result
+            present_kv = None
+        
         x = x + self.drop_path1(attn_output)
 
         # Second Sub layer: Feed forward Network
         ffn_output = self.ffn(self.norm2(x))
         x = x + self.drop_path2(ffn_output)
 
-        return x
+        if use_cache:
+            return x, present_kv
+        else:
+            return x

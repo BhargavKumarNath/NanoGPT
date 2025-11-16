@@ -44,11 +44,9 @@ class MultiHeadAttention(nn.Module):
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rope:
-            # During generation with KV cache, seq_len is 1. We need to apply RoPE
-            # based on the token's actual position in the sequence.
             q, k = self.rope(q, k, start_pos)
         
-        # KV Cache Logic
+        # KV Cache Logic - now k and v already have correct positional encoding
         if past_kv is not None:
             # Concatenate the new k, v with the cached ones
             past_key, past_value = past_kv
@@ -62,8 +60,10 @@ class MultiHeadAttention(nn.Module):
         attn_scores = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
         if mask is not None:
-            # The mask needs to be sliced correctly for single-token generation
-            attn_scores = attn_scores.masked_fill(mask[:, :, -seq_len:, :], float('-inf'))
+            # q has length seq_len (which is 1 during generation after first step)
+            # k has full length including cache
+            kv_len = k.size(-2)
+            attn_scores = attn_scores.masked_fill(mask[:, :, -seq_len:, :kv_len], float('-inf'))
         
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
@@ -144,13 +144,11 @@ class GroupedQueryAttention(nn.Module):
         v = self.wv(x)
 
         # 2. Reshape for multi-head computation
-        # q: (batch_size, seq_len, embed_dim) -> (batch_size, num_heads, seq_len, head_dim)
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # k, v: (batch_size, seq_len, num_kv_heads * head_dim) -> (batch_size, num_kv_heads, seq_len, head_dim)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
-        # 3. Apply RoPE
+        # 3. Apply RoPE BEFORE handling cache
         if self.rope:
             q, k = self.rope(q, k, start_pos)
         
@@ -169,12 +167,12 @@ class GroupedQueryAttention(nn.Module):
         k_rep = self.repeat_kv(k, self.kv_repeat_factor)
         v_rep = self.repeat_kv(v, self.kv_repeat_factor)
 
-        # 6. Compute attention scores (same as MHA from here)
+        # 6. Compute attention scores
         attn_scores = (q @ k_rep.transpose(-2, -1)) * (self.head_dim ** -0.5)
 
         if mask is not None:
-            # The mask needs to be sliced correctly for single-token generation
-            attn_scores = attn_scores.masked_fill(mask[:, :, -seq_len:, :], float('-inf'))
+            kv_len = k_rep.size(-2)
+            attn_scores = attn_scores.masked_fill(mask[:, :, -seq_len:, :kv_len], float('-inf'))
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
@@ -198,10 +196,10 @@ class SlidingWindowAttention(nn.Module):
     """
     def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int, window_size: int, dropout: float = 0.1, bias: bool = True, rope: RotaryPositionalEmbeddings = None):
         super().__init__()
-        # Can reuse the GQA implementation for the core logic
+        # GQA implementation for the core logic
         self.gqa = GroupedQueryAttention(embed_dim, num_heads, num_kv_heads, dropout, bias, rope=rope)
         self.window_size = window_size
-        self.mask = None # Cache for the attention mask
+        self.mask = None
 
     def _create_sliding_window_mask(self, seq_len: int, device: torch.device):
         """Creates a causal sliding window mask (True = masked)."""
@@ -214,7 +212,7 @@ class SlidingWindowAttention(nn.Module):
         # For each token position i, unmask the valid window range
         for i in range(seq_len):
             start = max(0, i - self.window_size)
-            end = i + 1  # include itself
+            end = i + 1  
             mask[i, start:end] = False
 
         # Add dimensions for batch and heads for broadcasting
