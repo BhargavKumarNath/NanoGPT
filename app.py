@@ -37,7 +37,8 @@ model.eval()
 print("Model and tokenizer loaded successfully.")
 
 # Generation Function
-def generate_story(prompt, max_new_tokens, temperature, top_p):
+# CHANGE 1: Add top_k to the function definition
+def generate_story(prompt, max_new_tokens, temperature, top_p, top_k):
     """The main function that Gradio will call."""
     if not prompt:
         return "Please provide a starting prompt."
@@ -48,11 +49,13 @@ def generate_story(prompt, max_new_tokens, temperature, top_p):
         start_tokens_tensor = torch.tensor([start_tokens], dtype=torch.long, device=device)
         
         # Generate
+        # CHANGE 2: Pass top_k to the model.generate() call
         generated_tokens = model.generate(
             start_tokens_tensor,
             max_new_tokens=int(max_new_tokens),
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
+            top_k=int(top_k) 
         )
         
         # Decode the generated tokens
@@ -77,6 +80,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
                 max_tokens_slider = gr.Slider(minimum=10, maximum=250, value=100, step=1, label="Max New Tokens")
                 temp_slider = gr.Slider(minimum=0.1, maximum=1.5, value=0.8, step=0.05, label="Temperature")
                 top_p_slider = gr.Slider(minimum=0.1, maximum=1.0, value=0.9, step=0.05, label="Top-p (Nucleus Sampling)")
+                
+                # CHANGE 3: Add a new slider for Top-k
+                top_k_slider = gr.Slider(minimum=1, maximum=50, value=5, step=1, label="Top-k")
 
             generate_button = gr.Button("Generate Story", variant="primary")
             
@@ -85,7 +91,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             
     generate_button.click(
         fn=generate_story,
-        inputs=[prompt_box, max_tokens_slider, temp_slider, top_p_slider],
+        inputs=[prompt_box, max_tokens_slider, temp_slider, top_p_slider, top_k_slider],
         outputs=output_box
     )
 

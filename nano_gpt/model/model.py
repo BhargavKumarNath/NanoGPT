@@ -193,7 +193,6 @@ class NanoGptModel(nn.Module):
 
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 probs[indices_to_remove] = 0
-                probs = probs / probs.sum(dim=-1, keepdim=True)
 
             # Sample next token
             idx_next = torch.multinomial(probs, num_samples=1)
