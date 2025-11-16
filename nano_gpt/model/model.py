@@ -49,7 +49,8 @@ class NanoGptModel(nn.Module):
                     config.num_heads,
                     config.num_kv_heads,
                     config.dropout,
-                    config.bias
+                    config.bias,
+                    rope=rope
                 )
             elif config.attention_type == 'swa':
                 attn = SlidingWindowAttention(
@@ -58,7 +59,8 @@ class NanoGptModel(nn.Module):
                     config.num_kv_heads,
                     config.window_size,
                     config.dropout,
-                    config.bias
+                    config.bias,
+                    rope=rope
                 )
             else:
                 raise ValueError(f"Unknown attention type: {config.attention_type}")
@@ -101,87 +103,105 @@ class NanoGptModel(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     # Forward Pass
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, past_kv_cache: list = None, use_cache: bool = False):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None, past_kv_cache: list = None, use_cache: bool = False, start_pos: int = 0):
         batch_size, seq_len = idx.shape
-        
         x = self.token_embeddings(idx)
-        
         present_kv_cache = [] if use_cache else None
 
         for i, block in enumerate(self.blocks):
             past_kv = past_kv_cache[i] if past_kv_cache is not None else None
             
             h = block.norm1(x)
-            attn_output = block.attn(h, past_kv=past_kv, use_cache=use_cache)
+            attn_output = block.attn(h, past_kv=past_kv, use_cache=use_cache, start_pos=start_pos)
+            
             if use_cache:
                 attn_output, present_kv = attn_output
                 present_kv_cache.append(present_kv)
+            
             x = x + block.drop_path1(attn_output)
             
             h = block.norm2(x)
             ffn_output = block.ffn(h)
             x = x + block.drop_path2(ffn_output)
-            
+        
         x = self.final_norm(x)
         logits = self.lm_head(x)
-        
+
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
+
         if use_cache:
             return logits, loss, present_kv_cache
         else:
             return logits, loss
 
+
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int = None, top_p: float = None):
+    def generate(
+    self,
+    idx: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_k: int = None,
+    top_p: float = None
+):
         """
-        Autoregressively generate a sequence of tokens using Top-k and/or Top-p (Nucleus) sampling.
+        Autoregressively generate a sequence of tokens using Top-k and/or Top-p sampling.
+        Tracks start_pos for RoPE.
         """
         self.eval()
         kv_cache = None
-        
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.seq_len else idx[:, -self.config.seq_len:]
-            
-            logits, _, kv_cache = self(idx_cond, use_cache=True, past_kv_cache=kv_cache)
-            
+
+        for i in range(max_new_tokens):
+            # Current position in the sequence
+            start_pos = idx.size(1) - 1 if i > 0 else 0
+
+            # For the first token, use full prompt; else only newest token
+            idx_cond = idx if i == 0 else idx[:, -1:]
+
+            # Forward pass with start_pos
+            logits, _, kv_cache = self(
+                idx_cond,
+                use_cache=True,
+                past_kv_cache=kv_cache,
+                start_pos=start_pos
+            )
+
             logits = logits[:, -1, :] / temperature
-            
+
             # Optional Top-K sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
 
-            # Apply softmax to get probabilities
+            # Softmax probabilities
             probs = F.softmax(logits, dim=-1)
-            
+
             # Top-p (Nucleus) sampling
             if top_p is not None:
-                # Sort probabilities in descending order
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                # Calculate cumulative probabilities
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                
+
                 sorted_indices_to_remove = cumulative_probs > top_p
-                # Shift the indices to the right to keep the first one that exceeds the threshold
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
-                
-                # Create a mask of tokens to remove
+
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                # Apply the mask by setting the probability of removed tokens to 0
                 probs[indices_to_remove] = 0
-                # Renormalize the probabilities
                 probs = probs / probs.sum(dim=-1, keepdim=True)
-            
-            # Sample from the (potentially modified) distribution
+
+            # Sample next token
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
-            
+
         self.train()
         return idx
+
 
     # Optimizer Configuration
     def configure_optimizer(self, weight_decay, learning_rate, betas):
