@@ -12,7 +12,7 @@ from nano_gpt.tokenizer.bpe import BpeTokenizer
 from nano_gpt.data.dataset import StreamingTextDataset
 
 # Experiment Config
-experiment_name = "gqa"   
+experiment_name = "swa_long_context"   
 
 print(f"\n--- Running Experiment: {experiment_name} ---")
 
@@ -25,7 +25,7 @@ eval_interval = 500
 log_interval = 50   
 
 # Training Config
-max_steps = 50000
+max_steps = 30000
 learning_rate = 6e-4
 weight_decay = 0.1
 beta1 = 0.9
@@ -70,30 +70,49 @@ vocab_size = max(tokenizer.vocab.keys()) + 1
 print(f"Tokenizer vocab size: {vocab_size}")
 
 # Dataset
-seq_len = 128
+seq_len = 256
 dataset = StreamingTextDataset(tokenizer, corpus_path, seq_len)
 dataloader = DataLoader(dataset, batch_size=micro_batch_size)
 
 # EXPERIMENT-BASED MODEL CONFIG
+attention_type = "mha"
+num_kv_heads = None
+window_size = None
+
 if experiment_name == "mha_baseline":
     attention_type = "mha"
-    num_kv_heads = None
+
 elif experiment_name == "gqa":
     attention_type = "gqa"
-    num_kv_heads = 2       
+    num_kv_heads = 2
+
+elif experiment_name == "swa_long_context":
+    attention_type = "swa"
+    num_kv_heads = 2      
+    window_size = 64      
+    seq_len = 256         
+
 else:
     raise ValueError(f"Unknown experiment: {experiment_name}")
-print(f"Attention = {attention_type}, num_kv_heads = {num_kv_heads}")
+
+print(f"Experiment: {experiment_name}")
+print(f" → attention_type = {attention_type}")
+print(f" → num_kv_heads = {num_kv_heads}")
+print(f" → window_size = {window_size}")
+print(f" → seq_len = {seq_len}")
+
 model_config = NanoGptConfig(
     vocab_size=vocab_size,
     embed_dim=384,
     num_layers=6,
-    num_heads=8,              
+    num_heads=8,
     seq_len=seq_len,
     dropout=0.1,
     attention_type=attention_type,
     num_kv_heads=num_kv_heads,
+    window_size=window_size,
 )
+
 model = NanoGptModel(model_config).to(device)
 print(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters.")
 

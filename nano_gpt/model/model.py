@@ -168,7 +168,8 @@ class NanoGptModel(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int = None,
-        top_p: float = None
+        top_p: float = None,
+        repetition_penalty: float = 1.0
     ):
         """
         Autoregressively generate a sequence of tokens using Top-k and/or Top-p sampling.
@@ -178,27 +179,32 @@ class NanoGptModel(nn.Module):
         kv_cache = None
 
         for i in range(max_new_tokens):
-            # Determine which tokens to process
             if i == 0:
-                # First iteration: process the entire prompt
                 idx_cond = idx
                 start_pos = 0
             else:
-                # Subsequent iterations: only process the last token
                 idx_cond = idx[:, -1:]
-                # start_pos is where this new token sits in the full sequence
                 start_pos = idx.size(1) - 1
 
-            # Forward pass with KV cache and correct start_pos
             logits, _, kv_cache = self(
-                idx_cond,
-                use_cache=True,
-                past_kv_cache=kv_cache,
-                start_pos=start_pos
+                idx_cond, use_cache=True, past_kv_cache=kv_cache, start_pos=start_pos
             )
 
-            # Get logits for the last position and apply temperature
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :]
+
+            if repetition_penalty != 1.0:
+                # Create a view of logits for the current batch item
+                for i in range(idx.shape[0]):
+                    # Find unique tokens in the context
+                    unique_tokens = torch.unique(idx[i, -self.config.seq_len:])
+                    # Apply penalty: for positive logits, divide; for negative, multiply
+                    logits[i, unique_tokens] = torch.where(
+                        logits[i, unique_tokens] > 0,
+                        logits[i, unique_tokens] / repetition_penalty,
+                        logits[i, unique_tokens] * repetition_penalty
+                    )
+            
+            logits = logits / temperature
 
             # Apply Top-K filtering if specified
             if top_k is not None and top_k > 0:
