@@ -15,7 +15,8 @@ class NanoGptConfig:
     attention_type: str = 'mha'
     num_kv_heads: int = 2
     window_size: int = 32
-
+    num_global_heads: int = None
+    
     # FFN Specific 
     ffn_hidden_dim: int = None
     

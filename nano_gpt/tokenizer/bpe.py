@@ -36,55 +36,88 @@ class BpeTokenizer:
         self.pattern = re.compile(GPT4_SPLIT_PATTERN)
     
     def train(self, corpus_path: str, vocab_size: int, special_tokens: list = None):
-        """Train the tokenizer on a given corpus"""
+        """Train the tokenizer on a given corpus with progress logging"""
         assert vocab_size >= 256
         if special_tokens is None:
             special_tokens = []
-        
+
+        print(f"\n[BPE] Starting training...")
+        print(f"[BPE] Corpus: {corpus_path}")
+        print(f"[BPE] Target vocab size: {vocab_size}")
+
         # 1. Initialize vocabulary with bytes and special tokens
         self.vocab = {i: bytes([i]) for i in range(256)}
         for i, token in enumerate(special_tokens):
             self.special_tokens[token] = vocab_size + i
             self.vocab[vocab_size + i] = token.encode("utf-8")
-        
+
         self.inverse_special_tokens = {v: k for k, v in self.special_tokens.items()}
 
-        # 2. Read Corpus and tokenize it into chunks
+        # 2. Read Corpus
+        print("[BPE] Reading corpus...")
         with open(corpus_path, 'r', encoding='utf-8') as f:
             text = f.read()
-        chunks = re.findall(self.pattern, text)
-        tokenized_chunks = [list(chunk.encode('utf-8')) for chunk in chunks]
+        print(f"[BPE] Corpus loaded ({len(text)/1e6:.2f}M chars)")
 
-        # 3. Iteratively learn merges
+        print("[BPE] Splitting into chunks...")
+        chunks = re.findall(self.pattern, text)
+        print(f"[BPE] Total chunks: {len(chunks):,}")
+
+        print("[BPE] Encoding chunks to bytes...")
+        tokenized_chunks = [list(chunk.encode('utf-8')) for chunk in chunks]
+        print(f"[BPE] Byte tokenized.")
+
+        # 3. Iterative merges
         num_merges = vocab_size - 256
         self.merges = {}
+        print(f"[BPE] Total merges to perform: {num_merges}")
 
         for i in range(num_merges):
+
+            if i % 10 == 0:
+                print(f"[BPE] Merge step {i}/{num_merges} (scanning pairs...)")
+
+            # Count pairs
             pair_counts = defaultdict(int)
             for chunk_ids in tokenized_chunks:
+                # FAST path: skip tiny chunks
+                if len(chunk_ids) < 2:
+                    continue
                 for pair, count in get_pair_counts(chunk_ids).items():
                     pair_counts[pair] += count
-            
-            if not pair_counts:
-                break # No more pairs to merge
 
+            if not pair_counts:
+                print("[BPE] No more pairs. Stopping early.")
+                break
+
+            # Choose most frequent pair
             most_frequent_pair = max(pair_counts, key=pair_counts.get)
             new_token_id = 256 + i
-            
-            # Perform the merge in all chunks
-            tokenized_chunks = [merge_pairs(chunk_ids, most_frequent_pair, new_token_id) for chunk_ids in tokenized_chunks]
-            
+
+            if i % 10 == 0:
+                print(f"[BPE]  • Most frequent pair so far: {most_frequent_pair} → new token {new_token_id}")
+
+            # Apply merge across all chunks
+            tokenized_chunks = [
+                merge_pairs(chunk_ids, most_frequent_pair, new_token_id)
+                for chunk_ids in tokenized_chunks
+            ]
+
+            # Record merge
             self.merges[most_frequent_pair] = new_token_id
-            self.vocab[new_token_id] = self.vocab[most_frequent_pair[0]] + self.vocab[most_frequent_pair[1]]
-            
+            self.vocab[new_token_id] = (
+                self.vocab[most_frequent_pair[0]] + self.vocab[most_frequent_pair[1]]
+            )
+
             if (i + 1) % 100 == 0:
-                print(f"Merge {i+1}/{num_merges} completed.")
-        
-        # Add special tokens to the main vocab for encoding purposes
+                print(f"[BPE] ---- {i+1}/{num_merges} merges completed ----")
+
+        # Add special tokens to vocab
         for token, idx in self.special_tokens.items():
             self.vocab[idx] = token.encode("utf-8")
 
-        print("Training complete.")
+        print("\n[BPE] Training complete.")
+
 
     def _encode_chunk(self, text_bytes: list) -> list:
         """Encodes a single chunk of text that has already been byte-encoded."""

@@ -5,6 +5,7 @@ import sys
 import time
 import json
 import math 
+# Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from nano_gpt.config.model_config import NanoGptConfig
 from nano_gpt.model.model import NanoGptModel
@@ -12,7 +13,7 @@ from nano_gpt.tokenizer.bpe import BpeTokenizer
 from nano_gpt.data.dataset import StreamingTextDataset
 
 # Experiment Config
-experiment_name = "swa_long_context"   
+experiment_name = "hybrid_attention"
 
 print(f"\n--- Running Experiment: {experiment_name} ---")
 
@@ -46,10 +47,8 @@ pt_dtype = torch.float16 if device == "cuda" else torch.float32
 def get_lr(step):
     """Learning rate schedule with warmup and cosine decay"""
     if step < warmup_steps:
-        # Linear warmup
         return learning_rate * (step / warmup_steps)
     else:
-        # Cosine decay after warmup
         progress = (step - warmup_steps) / (max_steps - warmup_steps)
         return learning_rate * 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -78,6 +77,7 @@ dataloader = DataLoader(dataset, batch_size=micro_batch_size)
 attention_type = "mha"
 num_kv_heads = None
 window_size = None
+num_global_heads = None 
 
 if experiment_name == "mha_baseline":
     attention_type = "mha"
@@ -92,6 +92,13 @@ elif experiment_name == "swa_long_context":
     window_size = 64      
     seq_len = 256         
 
+elif experiment_name == "hybrid_attention":
+    attention_type = "hybrid"   
+    num_kv_heads = None         # HybridAttention uses full K,V per head
+    window_size = 64            # Local window size
+    num_global_heads = 2        # Number of global heads
+    seq_len = 256
+
 else:
     raise ValueError(f"Unknown experiment: {experiment_name}")
 
@@ -99,18 +106,20 @@ print(f"Experiment: {experiment_name}")
 print(f" → attention_type = {attention_type}")
 print(f" → num_kv_heads = {num_kv_heads}")
 print(f" → window_size = {window_size}")
+print(f" → num_global_heads = {num_global_heads}") 
 print(f" → seq_len = {seq_len}")
 
 model_config = NanoGptConfig(
     vocab_size=vocab_size,
-    embed_dim=384,
-    num_layers=6,
+    embed_dim=256,
+    num_layers=4,
     num_heads=8,
     seq_len=seq_len,
-    dropout=0.1,
+    dropout=0.2,
     attention_type=attention_type,
     num_kv_heads=num_kv_heads,
     window_size=window_size,
+    num_global_heads=num_global_heads, 
 )
 
 model = NanoGptModel(model_config).to(device)
@@ -129,6 +138,7 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     start_time = time.time()
+    
     # Evaluation + Checkpoint
     if step > 0 and step % eval_interval == 0:
         print(f"\nSaving checkpoint at step {step}")
@@ -152,7 +162,6 @@ for step in range(max_steps):
             top_p=0.9
         )
         print("Sample Generation:")
-        # Safe decode filter out invalid tokens
         generated_ids = generated[0].tolist()
         valid_ids = [tid for tid in generated_ids if tid in tokenizer.vocab]
         try:
@@ -181,6 +190,7 @@ for step in range(max_steps):
     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     scaler.step(optimizer)
     scaler.update()
+    
     # Logging
     if step % log_interval == 0:
         ms = (time.time() - start_time) * 1000

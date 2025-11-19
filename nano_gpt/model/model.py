@@ -4,12 +4,11 @@ import torch.nn.functional as F
 from typing import Type
 
 from .block import TransformerBlock
-from .attention import MultiHeadAttention, GroupedQueryAttention, SlidingWindowAttention
+from .attention import MultiHeadAttention, GroupedQueryAttention, SlidingWindowAttention, HybridAttention
 from .feed_forward import SwiGLUFeedForward
 from .normalization import RMSNorm
 from .positional_encoding import RotaryPositionalEmbeddings
 from ..config.model_config import NanoGptConfig
-
 
 class NanoGptModel(nn.Module):
     """Full NanoGPT language model"""
@@ -60,6 +59,16 @@ class NanoGptModel(nn.Module):
                     config.window_size,
                     config.dropout,
                     config.bias,
+                    rope=rope
+                )
+            elif config.attention_type == 'hybrid':
+                attn = HybridAttention(
+                    embed_dim=config.embed_dim,
+                    num_heads=config.num_heads,
+                    num_global_heads=config.num_global_heads,
+                    window_size=config.window_size,
+                    dropout=config.dropout,
+                    bias=config.bias,
                     rope=rope
                 )
             else:

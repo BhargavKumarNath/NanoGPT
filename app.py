@@ -14,8 +14,8 @@ add_safe_globals([NanoGptConfig])
 # Configuration
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-CHECKPOINT_PATH = "out/gqa/final_model.pt"
-TOKENIZER_PATH = "out/gqa/tinystories_tokenizer"
+CHECKPOINT_PATH = "out/hybrid_attention/final_model.pt"
+TOKENIZER_PATH = "out/hybrid_attention/tinystories_tokenizer"
 
 # Model & Tokenizer Loading
 print("Loading model and tokenizer...")
