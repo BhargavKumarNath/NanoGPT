@@ -181,70 +181,93 @@ class NanoGptModel(nn.Module):
         repetition_penalty: float = 1.0
     ):
         """
-        Autoregressively generate a sequence of tokens using Top-k and/or Top-p sampling.
-        Tracks start_pos for RoPE correctly.
+        Autoregressively generate tokens with improved sampling.
+        
+        Args:
+            idx: Starting token indices (batch_size, seq_len)
+            max_new_tokens: Number of tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering threshold
+            top_p: Nucleus sampling threshold
+            repetition_penalty: Penalty for repeating tokens (>1.0 reduces repetition)
         """
         self.eval()
         kv_cache = None
 
-        for i in range(max_new_tokens):
-            if i == 0:
+        for step in range(max_new_tokens):
+            # Prepare input for current step
+            if step == 0:
                 idx_cond = idx
                 start_pos = 0
             else:
                 idx_cond = idx[:, -1:]
                 start_pos = idx.size(1) - 1
 
+            # Forward pass with KV cache
             logits, _, kv_cache = self(
                 idx_cond, use_cache=True, past_kv_cache=kv_cache, start_pos=start_pos
             )
 
-            logits = logits[:, -1, :]
+            # Get logits for the last position
+            logits = logits[:, -1, :]  # (batch_size, vocab_size)
 
+            # Apply repetition penalty
             if repetition_penalty != 1.0:
-                # Create a view of logits for the current batch item
-                for i in range(idx.shape[0]):
-                    # Find unique tokens in the context
-                    unique_tokens = torch.unique(idx[i, -self.config.seq_len:])
-                    # Apply penalty: for positive logits, divide; for negative, multiply
-                    logits[i, unique_tokens] = torch.where(
-                        logits[i, unique_tokens] > 0,
-                        logits[i, unique_tokens] / repetition_penalty,
-                        logits[i, unique_tokens] * repetition_penalty
-                    )
+                batch_size = idx.shape[0]
+                
+                # Process each sequence in the batch
+                for batch_idx in range(batch_size):
+                    # Get unique tokens in the current sequence (last seq_len tokens)
+                    context_length = min(self.config.seq_len, idx.shape[1])
+                    context_tokens = idx[batch_idx, -context_length:]
+                    unique_tokens = torch.unique(context_tokens)
+                    
+                    # Apply penalty: reduce logits for tokens that already appeared
+                    # If logit > 0, divide by penalty (make it less likely)
+                    # If logit < 0, multiply by penalty (make it even less likely)
+                    for token_id in unique_tokens:
+                        if logits[batch_idx, token_id] > 0:
+                            logits[batch_idx, token_id] /= repetition_penalty
+                        else:
+                            logits[batch_idx, token_id] *= repetition_penalty
             
+            # Apply temperature
             logits = logits / temperature
 
-            # Apply Top-K filtering if specified
+            # Apply Top-K filtering
             if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                top_k = min(top_k, logits.size(-1))  # Safety check
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = -float('Inf')
 
             # Convert to probabilities
             probs = F.softmax(logits, dim=-1)
 
-            # Apply Top-P (nucleus) filtering if specified
+            # Apply Top-P (nucleus) filtering
             if top_p is not None and top_p < 1.0:
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-                # Remove tokens with cumulative probability above the threshold
+                # Remove tokens with cumulative probability above threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
-                # Shift the indices to the right to keep at least one token
+                
+                # Keep at least one token (shift the mask)
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
 
-                # Scatter back to original indexing
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                # Scatter sorted indices to original indexing
+                indices_to_remove = torch.zeros_like(probs, dtype=torch.bool)
+                indices_to_remove.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+                
                 probs[indices_to_remove] = 0.0
                 
                 # Renormalize
                 probs = probs / probs.sum(dim=-1, keepdim=True)
 
-            # Sample the next token
+            # Sample next token
             idx_next = torch.multinomial(probs, num_samples=1)
             
-            # Append to the sequence
+            # Append to sequence
             idx = torch.cat((idx, idx_next), dim=1)
 
         self.train()

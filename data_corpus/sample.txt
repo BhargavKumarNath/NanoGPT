@@ -1,5 +1,0 @@
-Hello world! This is a test.
-Let's see how the tokenizer works on this simple text.
-Repetition is key, repetition helps learning.
-<|endoftext|>
-This is another sentence.
